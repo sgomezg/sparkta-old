@@ -28,7 +28,10 @@ import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.sql.SQLContext
 import org.apache.spark.streaming.dstream.DStream
 import org.apache.spark.streaming.{Duration, StreamingContext}
+import org.json4s.{DefaultFormats, _}
+import org.json4s.jackson.JsonMethods._
 import org.reflections.Reflections
+import spark.jobserver._
 
 import com.stratio.sparkta.aggregator.{DataCube, Rollup}
 import com.stratio.sparkta.driver.dto.AggregationPoliciesDto
@@ -42,8 +45,8 @@ class StreamingContextService(generalConfig: Config, jars: Seq[File]) extends SL
 
   def createStreamingContext(apConfig: AggregationPoliciesDto): StreamingContext = {
     val sc = SparkContextFactory.sparkContextInstance(generalConfig, jars)
-    val sqlContext = SparkContextFactory.sparkSqlContextInstance.get
-    val ssc = SparkContextFactory.sparkStreamingInstance(new Duration(apConfig.duration)).get
+    //    new SparktaJob(apConfig).runJob(sc, generalConfig)
+    val ssc = new StreamingContext(sc, new Duration(apConfig.duration))
     val inputs: Map[String, DStream[Event]] = SparktaJob.inputs(apConfig, ssc)
     val parsers: Seq[Parser] = SparktaJob.parsers(apConfig)
     val operators: Seq[Operator] = SparktaJob.operators(apConfig)
@@ -51,6 +54,12 @@ class StreamingContextService(generalConfig: Config, jars: Seq[File]) extends SL
     val dimensionsMap: Map[String, Dimension] = SparktaJob.instantiateDimensions(apConfig).toMap
     val dimensionsSeq: Seq[Dimension] = SparktaJob.instantiateDimensions(apConfig).map(_._2)
 
+    val bcOperatorsKeyOperation: Option[Broadcast[Map[String, (WriteOp, TypeOp)]]] = {
+      val opKeyOp = PolicyFactory.operatorsKeyOperation(operators)
+      if (opKeyOp.size > 0) Some(sc.broadcast(opKeyOp)) else None
+    }
+    val outputsConfig: Seq[(String, Boolean)] = apConfig.outputs.map(o =>
+      (o.name, Try(o.configuration.get("multiplexer").get.string.toBoolean).getOrElse(false)))
     val rollups: Seq[Rollup] = apConfig.rollups.map(r => {
       val components = r.dimensionAndBucketTypes.map(dab => {
         dimensionsMap.get(dab.dimensionName) match {
@@ -65,38 +74,27 @@ class StreamingContextService(generalConfig: Config, jars: Seq[File]) extends SL
       })
       new Rollup(components, operators)
     })
-
-    val bcOperatorsKeyOperation: Option[Broadcast[Map[String, (WriteOp, TypeOp)]]] = {
-      val opKeyOp = PolicyFactory.operatorsKeyOperation(operators)
-      if (opKeyOp.size > 0) Some(sc.broadcast(opKeyOp)) else None
-    }
-
-    val outputsConfig: Seq[(String, Boolean)] = apConfig.outputs.map(o =>
-      (o.name, Try(o.configuration.get("multiplexer").get.string.toBoolean).getOrElse(false)))
-
     val bcRollupOperatorSchema: Option[Broadcast[Seq[TableSchema]]] = {
       val rollOpSchema = PolicyFactory.rollupsOperatorsSchemas(rollups, outputsConfig, operators)
       if (rollOpSchema.size > 0) Some(sc.broadcast(rollOpSchema)) else None
     }
+    val outputs = SparktaJob.outputs(
+      apConfig, sc, bcOperatorsKeyOperation,
+      bcRollupOperatorSchema)
 
-    val outputs = SparktaJob.outputs(apConfig, sc, bcOperatorsKeyOperation, bcRollupOperatorSchema)
     //TODO only support one input
     val input: DStream[Event] = inputs.head._2
-    SparktaJob.saveRawData(apConfig, sqlContext, input)
+    //TODO only support one output
+    val output = outputs.head._2
     val parsed = SparktaJob.applyParsers(input, parsers)
-    val dataCube = new DataCube(dimensionsSeq, rollups).setUp(parsed)
-    outputs.map(_._2.persist(dataCube))
+    output.persist(new DataCube(dimensionsSeq, rollups).setUp(parsed))
+    SparkContextFactory.sscMap.put(apConfig.name, ssc)
+    //    SparkContextFactory.sscMap(apConfig.name)
     ssc
   }
 }
 
-object SparktaJob {
-
-  @tailrec
-  def applyParsers(input: DStream[Event], parsers: Seq[Parser]): DStream[Event] = {
-    if (parsers.size > 0) applyParsers(input.map(event => parsers.head.parse(event)), parsers.drop(1))
-    else input
-  }
+object StreamingContextService {
 
   val getClasspathMap: Map[String, String] = {
     val reflections = new Reflections()
@@ -106,7 +104,16 @@ object SparktaJob {
     val outputs = reflections.getSubTypesOf(classOf[Output]).toList
     val parsers = reflections.getSubTypesOf(classOf[Parser]).toList
     val plugins = inputs ++ bucketers ++ operators ++ outputs ++ parsers
-    plugins map (t => t.getSimpleName -> t.getCanonicalName) toMap
+    plugins.map(t => t.getSimpleName -> t.getCanonicalName).toMap
+  }
+}
+
+object SparktaJob extends SparkJob {
+
+  @tailrec
+  def applyParsers(input: DStream[Event], parsers: Seq[Parser]): DStream[Event] = {
+    if (parsers.size > 0) applyParsers(input.map(event => parsers.head.parse(event)), parsers.drop(1))
+    else input
   }
 
   def inputs(apConfig: AggregationPoliciesDto, ssc: StreamingContext): Map[String, DStream[Event]] =
@@ -141,7 +148,7 @@ object SparktaJob {
     clazz.getDeclaredConstructor(classOf[Map[String, Serializable]]).newInstance(properties).asInstanceOf[C]
 
   def tryToInstantiate[C](classAndPackage: String, block: Class[_] => C): C = {
-    val clazMap: Map[String, String] = SparktaJob.getClasspathMap
+    val clazMap: Map[String, String] = StreamingContextService.getClasspathMap
 
     val finalClazzToInstance = clazMap.getOrElse(classAndPackage, classAndPackage)
     try {
@@ -162,6 +169,23 @@ object SparktaJob {
 
   def dimensionsSeq(apConfig: AggregationPoliciesDto): Seq[Dimension] = instantiateDimensions(apConfig).map(_._2)
 
+  def rollups(apConfig: AggregationPoliciesDto,
+              dimensionsMap: Map[String, Dimension],
+              operators: Seq[Operator]): Seq[Rollup] = apConfig.rollups.map(r => {
+    val components = r.dimensionAndBucketTypes.map(dab => {
+      dimensionsMap.get(dab.dimensionName) match {
+        case Some(x: Dimension) => x.bucketTypes.contains(new BucketType(dab.bucketType)) match {
+          case true => (x, new BucketType(dab.bucketType, dab.configuration.getOrElse(Map())))
+          case _ =>
+            throw new DriverException(
+              "Bucket type " + dab.bucketType + " not supported in dimension " + dab.dimensionName)
+        }
+        case None => throw new DriverException("Dimension name " + dab.dimensionName + " not found.")
+      }
+    })
+    new Rollup(components, operators)
+  })
+
   def instantiateDimensions(apConfig: AggregationPoliciesDto): Seq[(String, Dimension)] = {
     val map: Seq[(String, Dimension)] = apConfig.dimensions.map(d => (d.name,
       new Dimension(d.name, tryToInstantiate[Bucketer](d.dimensionType, (c) => {
@@ -180,5 +204,61 @@ object SparktaJob {
       def rawDataStorage: RawDataStorageService = new RawDataStorageService(sqlContext, apConfig.rawDataParquetPath)
       rawDataStorage.save(input)
     }
+  }
+
+  override def runJob(sc: SparkContext, config: Config): Any = {
+    implicit val formats = DefaultFormats + new JsoneyStringSerializer()
+    val apConfig = parse(config.getString("input.policy")).extract[AggregationPoliciesDto]
+    val ssc = new StreamingContext(sc, new Duration(apConfig.duration))
+    val inputs: Map[String, DStream[Event]] = SparktaJob.inputs(apConfig, ssc)
+    val parsers: Seq[Parser] = SparktaJob.parsers(apConfig)
+    val operators: Seq[Operator] = SparktaJob.operators(apConfig)
+    //TODO workaround this instantiateDimensions(apConfig).toMap.map(_._2) is not serializable.
+    val dimensionsMap: Map[String, Dimension] = SparktaJob.instantiateDimensions(apConfig).toMap
+    val dimensionsSeq: Seq[Dimension] = SparktaJob.instantiateDimensions(apConfig).map(_._2)
+    val bcOperatorsKeyOperation: Option[Broadcast[Map[String, (WriteOp, TypeOp)]]] = {
+      val opKeyOp = PolicyFactory.operatorsKeyOperation(operators)
+      if (opKeyOp.size > 0) Some(sc.broadcast(opKeyOp)) else None
+    }
+    val outputsConfig: Seq[(String, Boolean)] = apConfig.outputs.map(o =>
+      (o.name, Try(o.configuration.get("multiplexer").get.string.toBoolean).getOrElse(false)))
+    val rollups: Seq[Rollup] = apConfig.rollups.map(r => {
+      val components = r.dimensionAndBucketTypes.map(dab => {
+        dimensionsMap.get(dab.dimensionName) match {
+          case Some(x: Dimension) => x.bucketTypes.contains(new BucketType(dab.bucketType)) match {
+            case true => (x, new BucketType(dab.bucketType, dab.configuration.getOrElse(Map())))
+            case _ =>
+              throw new DriverException(
+                "Bucket type " + dab.bucketType + " not supported in dimension " + dab.dimensionName)
+          }
+          case None => throw new DriverException("Dimension name " + dab.dimensionName + " not found.")
+        }
+      })
+      new Rollup(components, operators)
+    })
+
+    val bcRollupOperatorSchema: Option[Broadcast[Seq[TableSchema]]] = {
+      val rollOpSchema = PolicyFactory.rollupsOperatorsSchemas(rollups, outputsConfig, operators)
+      if (rollOpSchema.size > 0) Some(sc.broadcast(rollOpSchema)) else None
+    }
+
+    val outputs = SparktaJob.outputs(
+      apConfig, sc, bcOperatorsKeyOperation,
+      bcRollupOperatorSchema)
+
+    //TODO only support one input
+    val input: DStream[Event] = inputs.head._2
+    //TODO only support one output
+    val output = outputs.head._2
+    val parsed = SparktaJob.applyParsers(input, parsers)
+    output.persist(new DataCube(dimensionsSeq, rollups).setUp(parsed))
+    SparkContextFactory.sscMap.put(apConfig.name, ssc)
+    ssc.start()
+  }
+
+  override def validate(sc: SparkContext, config: Config): SparkJobValidation = {
+    Try(parse(config.getString("input.policy")))
+      .map(x => SparkJobValid)
+      .getOrElse(SparkJobInvalid("No input.policy config param"))
   }
 }

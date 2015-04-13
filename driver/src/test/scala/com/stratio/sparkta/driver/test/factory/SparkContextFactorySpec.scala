@@ -66,12 +66,12 @@ class SparkContextFactorySpec extends FlatSpec with ShouldMatchers with BeforeAn
     sqc should be equals (otherSqc)
     SparkContextFactory.destroySparkContext
   }
-
-  it should "create and reuse same SparkStreamingContext" in new WithConfig {
-    val sc = SparkContextFactory.sparkContextInstance(config, Seq())
-    val ssc = SparkContextFactory.sparkStreamingInstance(batchDuraction)
-    ssc shouldNot be equals (None)
-    val otherSsc = SparkContextFactory.sparkStreamingInstance(batchDuraction)
-    ssc should be equals (otherSsc)
-  }
+//
+//  it should "create and reuse same SparkStreamingContext" in new WithConfig {
+//    val sc = SparkContextFactory.sparkContextInstance(config, Seq())
+//    val ssc = SparkContextFactory.sparkStreamingInstance(batchDuraction)
+//    ssc shouldNot be equals(None)
+//    val otherSsc = SparkContextFactory.sparkStreamingInstance(batchDuraction)
+//    ssc should be equals (otherSsc)
+//  }
 }

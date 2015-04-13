@@ -18,6 +18,7 @@ package com.stratio.sparkta.driver.factory
 
 import java.io.File
 import scala.collection.JavaConversions._
+import scala.collection.mutable.Map
 
 import akka.event.slf4j.SLF4JLogging
 import com.typesafe.config.Config
@@ -30,9 +31,9 @@ import org.apache.spark.{SparkConf, SparkContext}
  */
 object SparkContextFactory extends SLF4JLogging {
 
+  val sscMap: Map[String, StreamingContext] = Map()
   private var sc: Option[SparkContext] = None
   private var sqlContext: Option[SQLContext] = None
-  private var ssc: Option[StreamingContext] = None
 
   def sparkSqlContextInstance: Option[SQLContext] = {
     synchronized {
@@ -42,16 +43,6 @@ object SparkContextFactory extends SLF4JLogging {
       }
     }
     sqlContext
-  }
-
-  def sparkStreamingInstance(batchDuration: Duration): Option[StreamingContext] = {
-    synchronized {
-      ssc match {
-        case Some(_) => ssc
-        case None => ssc = Some(new StreamingContext(sc.get, batchDuration))
-      }
-    }
-    ssc
   }
 
   def sparkContextInstance(generalConfig: Config, jars: Seq[File]): SparkContext =
@@ -79,20 +70,21 @@ object SparkContextFactory extends SLF4JLogging {
     conf
   }
 
-  def destroySparkStreamingContext: Unit = {
+  def destroySparkStreamingContext(name: String): Unit = {
     synchronized {
-      if (ssc.isDefined) {
-        log.debug("Stopping streamingContext with name: " + ssc.get.sparkContext.appName)
-        ssc.get.stop(false)
-        log.debug("Stopped streamingContext with name: " + ssc.get.sparkContext.appName)
-        ssc = None
+      if (sscMap.contains(name)) {
+        val ssc = sscMap(name)
+        log.debug("Stopping streamingContext with name: " + ssc.sparkContext.appName)
+        ssc.stop()
+        ssc.awaitTermination()
+        log.debug("Stopped streamingContext with name: " + ssc.sparkContext.appName)
+        sscMap.remove(name)
       }
     }
   }
 
   def destroySparkContext: Unit = {
     synchronized {
-      destroySparkStreamingContext
       if (sc.isDefined) {
         log.debug("Stopping SparkContext with name: " + sc.get.appName)
         sc.get.stop()

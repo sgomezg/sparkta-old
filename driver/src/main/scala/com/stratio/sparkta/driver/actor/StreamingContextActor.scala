@@ -63,7 +63,7 @@ class StreamingContextActor
   override def postStop(): Unit = {
     ssc match {
       case Some(sc: StreamingContext) =>
-        SparkContextFactory.destroySparkStreamingContext
+        SparkContextFactory.destroySparkStreamingContext(sc.sparkContext.appName)
       case x => log.warn("Unrecognized StreamingContext to stop!", x)
     }
     super.postStop()
