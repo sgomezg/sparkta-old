@@ -26,6 +26,7 @@ tmp*
 temp*
 test-output
 build.log
+cache
 
 # other scm
 .svn

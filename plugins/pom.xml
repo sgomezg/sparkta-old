@@ -57,6 +57,7 @@
         <module>bucketer-tag</module>
         <module>bucketer-hierarchy</module>
         <module>input-rabbitMQ</module>
+        <module>output-parquet</module>
     </modules>
 
     <dependencies>
